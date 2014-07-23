@@ -12,9 +12,11 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -105,9 +107,8 @@ public class TestNCube
         {
             List<String> urls = new ArrayList<String>();
             urls.add("http://www.cedarsoftware.com");
-
-            NCubeManager.setUrlClassLoader(urls, "file");
-            NCubeManager.setUrlClassLoader(urls, "1.0.0");
+            NCubeManager.setBaseResourceUrls(urls, "file");
+            NCubeManager.setBaseResourceUrls(urls, "1.0.0");
             _classLoaderInitialize = false;
         }
     }
@@ -152,10 +153,10 @@ public class TestNCube
         }
         else if (test_db == MYSQL)
         {
-        /*
-        Schema for MYSQL:
-drop table n_cube;
-CREATE TABLE n_cube (
+        /*  Schema for MYSQL
+
+        drop table if exists `ncube`.n_cube;
+CREATE TABLE `ncube`.n_cube (
 n_cube_id bigint NOT NULL,
 n_cube_nm varchar(100) NOT NULL,
 n_tenant_id char(64),
@@ -178,9 +179,9 @@ PRIMARY KEY (n_cube_id),
 UNIQUE (n_cube_nm, version_no_cd, app_cd, status_cd)
 );
 
-drop trigger sysEffDateTrigger;
+drop trigger if exists `ncube`.sysEffDateTrigger;
 DELIMITER ;;
-CREATE trigger sysEffDateTrigger BEFORE INSERT ON n_cube
+CREATE trigger `ncube`.sysEffDateTrigger BEFORE INSERT ON `ncube`.n_cube
 FOR EACH ROW
 BEGIN
     SET NEW.sys_effective_dt = NOW();
@@ -1726,7 +1727,12 @@ DELIMITER ;
         ncube.setCell("Alexa", coord);
 
         String version = "0.1.0";
+
+        assertFalse(NCubeManager.doesCubeExist(conn, APP_ID, name, version, "SNAPSHOT", new Date()));
+
         NCubeManager.createCube(conn, APP_ID, ncube, version);
+
+        assertTrue(NCubeManager.doesCubeExist(conn, APP_ID, name, version, "SNAPSHOT", new Date()));
 
         NCube<String> cube = (NCube<String>) NCubeManager.loadCube(conn, APP_ID, name, version, "SNAPSHOT", new Date());
         assertTrue(DeepEquals.deepEquals(ncube, cube));
@@ -5237,56 +5243,6 @@ DELIMITER ;
 //    }
 
     @Test
-    public void testUrlCube() throws Exception
-    {
-        // required test from machine serving up pages (OS X - built-in Apache, for example)
-//        NCube ncube = NCubeManager.getNCubeFromResource("urlContent.json");
-//
-//        Properties props = System.getProperties();
-//        props.setProperty("NCUBE_BASE_URL", "http://www.myotherdrive.com/");
-//
-//        Map coord = new HashMap();
-//        coord.put("Sites", "Google");
-//        ncube.getCell(coord);
-//        String html = (String) ncube.getCell(coord);
-//
-//        assertNotNull(html);
-//        assertTrue(html.length() > 50);
-//        assertTrue(html.toLowerCase().contains("google"));
-//
-//        coord.put("Sites", "MyOtherDriveUrl");
-//        html = (String) ncube.getCell(coord);
-//        System.out.println("html = " + html);
-//        assertNotNull(html);
-//        assertTrue(html.length() > 50);
-//        assertTrue(html.toLowerCase().contains("myotherdrive"));
-//
-//        // Can't set System properties anymore progammatically unless signed
-//        coord.put("Sites", "MyOtherDriveUri");
-//        html = (String) ncube.getCell(coord);
-//
-//        assertNotNull(html);
-//        assertTrue(html.length() > 50);
-//        assertTrue(html.toLowerCase().contains("myotherdrive"));
-//
-//        coord.put("Sites", "MyOtherDriveUrlSSL");
-//        Object x = ncube.getCell(coord);
-//        System.out.println("x = " + x);
-//
-//        assertNotNull(html);
-//        assertTrue(html.length() > 50);
-//        assertTrue(html.toLowerCase().contains("myotherdrive"));
-//
-//        // Can't set System properties anymore progammatically unless signed
-//        coord.put("Sites", "MyOtherDriveUriSSL");
-//        html = (String) ncube.getCell(coord);
-//
-//        assertNotNull(html);
-//        assertTrue(html.length() > 50);
-//        assertTrue(html.toLowerCase().contains("myotherdrive"));
-    }
-
-    @Test
     public void testStringIds() throws Exception
     {
         NCube ncube = NCubeManager.getNCubeFromResource("stringIds.json");
@@ -6567,7 +6523,6 @@ DELIMITER ;
 
         coord.put("age", 16);
         Map multi = ncube.getCells(coord, output);
-        System.out.println("multi = " + multi);
         assertEquals(2, multi.size());
     }
 
@@ -6727,7 +6682,6 @@ DELIMITER ;
         NCube ncube = createCube();
         String json = ncube.toFormattedJson();
         ncube = NCube.fromSimpleJson(json);
-        System.out.println("ncube.getMetaProperties() = " + ncube.getMetaProperties());
         assertTrue(ncube.getMetaProperties().size() == 0);
 
         List<Axis> axes = ncube.getAxes();
@@ -6740,6 +6694,7 @@ DELIMITER ;
                 assertTrue(column.getMetaProperties().size() == 0);
             }
         }
+        NCubeManager.deleteCube(getConnection(), APP_ID, ncube.getName(), "0.1.0", true);
     }
 
     @Test
@@ -6830,6 +6785,105 @@ DELIMITER ;
         assertTrue(col.getMetaProperties().size() == 0);
     }
 
+    @Test
+    public void testHtmlCubeTitle() throws Exception
+    {
+        NCube ncube = NCubeManager.getNCubeFromResource("debugExp.json");
+        String html = ncube.toHtml();
+        assertNotNull(html);
+//        System.out.println("html = " + html);
+    }
+
+    @Test
+    public void testHtml2DCubeTitle() throws Exception
+    {
+        NCube ncube = NCubeManager.getNCubeFromResource("debugExp2D.json");
+        String html = ncube.toHtml();
+        assertNotNull(html);
+//        System.out.println("html = " + html);
+    }
+
+    /**
+     * Must set the URL to the path containing the test groovy code.  Do not include
+     * the com/... in the path.  This is a RESOURCE URL location, which points to the
+     * root of a resource hierarchy, in this case, the resources are groovy source code.
+     *
+     * This test is a 'spot' test, and should not be run with all the other tests. It should
+     * be ignored by default, unless you are testing the single-step debugging
+     * capabilities of n-cube Groovy.
+     */
+    @Ignore
+    public void testDebugExpression() throws Exception
+    {
+        List urls = new ArrayList();
+        urls.add("file:///Users/jderegnaucourt/Development/n-cube/src/test/resources/");
+        urls.add("http://www.cedarsoftware.com");
+        NCubeManager.setUrlClassLoader(urls, "file");
+
+        NCube ncube = NCubeManager.getNCubeFromResource("debugExp.json");
+        Map coord = new HashMap();
+        int age = 9;
+        coord.put("age", age);
+        assertEquals(Math.pow(age, 2), ncube.getCell(coord));
+    }
+
+    @Test
+    public void testReloadGroovyClass() throws Exception
+    {
+        String base = System.getProperty("java.io.tmpdir");
+        if (!base.endsWith("/"))
+        {
+            base += "/";
+        }
+
+        String url = "file://" + base;
+
+        List urls = new ArrayList();
+        urls.add(url);
+        urls.add("http://www.cedarsoftware.com");
+        NCubeManager.setBaseResourceUrls(urls, "file");
+
+        FileOutputStream fo = new FileOutputStream(base + "Abc.groovy");
+        String code = "import ncube.grv.exp.NCubeGroovyExpression; class Abc extends NCubeGroovyExpression { def run() { return 10 } }";
+        fo.write(code.getBytes());
+        fo.close();
+
+        NCube ncube = NCubeManager.getNCubeFromResource("testReloadGroovyClass.json");
+        Map coord = new HashMap();
+        coord.put("state", "OH");
+        Map output = new LinkedHashMap();
+        Map out = ncube.getCells(coord, output);
+        assertEquals(10, out.values().iterator().next());
+
+        NCubeManager.clearCubeList();
+        fo = new FileOutputStream(base + "Abc.groovy");
+        code = "import ncube.grv.exp.NCubeGroovyExpression; class Abc extends NCubeGroovyExpression { def run() { return 20 } }";
+        fo.write(code.getBytes());
+        fo.close();
+        fo.flush();
+
+        ncube = NCubeManager.getNCubeFromResource("testReloadGroovyClass.json");
+        out = ncube.getCells(coord, output);
+        assertEquals(20, out.values().iterator().next());
+    }
+
+    @Test
+    public void testCoordinateGetter()
+    {
+        NCube ncube = NCubeManager.getNCubeFromResource("arrays.json");
+        Iterator<Set<Column>> i = ncube.getCellMap().keySet().iterator();
+        while (i.hasNext())
+        {
+            Set<Column> cols = i.next();
+            Column col = cols.iterator().next();
+            Set<Long> coord =  new HashSet<>();
+            coord.add(col.getId());
+            Map<String, Object> coordinate = new CaseInsensitiveMap<>();
+            ncube.getColumnsAndCoordinateFromIds(coord, null, coordinate);
+            assertTrue(coordinate.containsKey("code"));
+            assertTrue(ncube.getCell(coordinate) instanceof Object[]);
+        }
+    }
 
     // ---------------------------------------------------------------------------------
     // ---------------------------------------------------------------------------------

@@ -69,6 +69,14 @@ public abstract class GroovyBase extends UrlCommandCell
 
     protected abstract String getMethodToExecute(Map args);
 
+    public static void clearCache()
+    {
+        compiledClasses.clear(); // Free up stored references to Compiled Classes
+        constructorMap.clear();  // free up stored references to Compiled Constructors
+        methodMap.clear(); // free up stored references to Compiled Methods
+        initMethodMap.clear();  // free up stored references to NCubeGroovyExpression.init() methods
+    }
+
     protected Object executeInternal(Object data, Map args)
     {
         String cubeName = getNCube(args).getName();
@@ -206,10 +214,10 @@ public abstract class GroovyBase extends UrlCommandCell
     {
         String url = getUrl();
         boolean isUrlUsed = StringUtilities.hasContent(url);
+        GroovyClassLoader urlLoader = (GroovyClassLoader)NCubeManager.getUrlClassLoader(cube.getVersion());
 
         if (isUrlUsed)
         {
-            GroovyClassLoader urlLoader = (GroovyClassLoader)NCubeManager.getUrlClassLoader(cube.getVersion());
             URL groovySourceUrl = urlLoader.getResource(url);
 
             if (groovySourceUrl == null)
@@ -217,22 +225,15 @@ public abstract class GroovyBase extends UrlCommandCell
                 throw new IllegalArgumentException("Groovy code source URL is non-relative, add base url to GroovyClassLoader on NCubeManager.setUrlClassLoader(): " + url);
             }
 
-
             GroovyCodeSource gcs = new GroovyCodeSource(groovySourceUrl);
             gcs.setCachable(false);
 
-            //  Can cut total test time in half if we use loader at this point instead of urlLoader
-            //  This would keep us from being able to subclass another external (urlized) class.
-            //  I think Groovy will load that correctly, but I'm not sure.  We need to come up with
-            //  a test for that and verify it works.
-            //GroovyClassLoader loader = (GroovyClassLoader)NCubeManager.getSimpleLoader(cube.getVersion());
             setRunnableCode(urlLoader.parseClass(gcs));
         }
         else
         {
             String groovySource = expandNCubeShortCuts(buildGroovy(getCmd(), cube.getName(), cmdHash));
-            GroovyClassLoader loader = (GroovyClassLoader)NCubeManager.getSimpleLoader(cube.getVersion());
-            setRunnableCode(loader.parseClass(groovySource));
+            setRunnableCode(urlLoader.parseClass(groovySource));
         }
         compiledClasses.put(cmdHash, getRunnableCode());
     }
@@ -323,10 +324,10 @@ public abstract class GroovyBase extends UrlCommandCell
         }
     }
 
-    public Set<String> getImports(String text, StringBuilder newGroovy)
+    public static Set<String> getImports(String text, StringBuilder newGroovy)
     {
         Matcher m = Regexes.importPattern.matcher(text);
-        Set<String> importNames = new LinkedHashSet<String>();
+        Set<String> importNames = new LinkedHashSet();
         while (m.find())
         {
             importNames.add(m.group(0));  // based on Regex pattern - if pattern changes, this could change

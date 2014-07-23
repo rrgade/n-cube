@@ -1,6 +1,7 @@
 package com.cedarsoftware.ncube;
 
 import com.cedarsoftware.ncube.formatters.JsonFormatter;
+import com.cedarsoftware.ncube.util.CdnClassLoader;
 import com.cedarsoftware.util.IOUtilities;
 import com.cedarsoftware.util.StringUtilities;
 import com.cedarsoftware.util.UniqueIdGenerator;
@@ -8,6 +9,7 @@ import com.cedarsoftware.util.io.JsonObject;
 import com.cedarsoftware.util.io.JsonReader;
 import com.cedarsoftware.util.io.JsonWriter;
 import groovy.lang.GroovyClassLoader;
+import ncube.grv.method.NCubeGroovyController;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
@@ -61,13 +63,16 @@ import java.util.regex.Matcher;
  */
 public class NCubeManager
 {
-    private static final Map<String, NCube> cubeList = new ConcurrentHashMap<String, NCube>();
+    private static final Map<String, NCube> cubeList = new ConcurrentHashMap();
     private static final Log LOG = LogFactory.getLog(NCubeManager.class);
-    private static Map<String, Map<String, Advice>> advices = new LinkedHashMap<String, Map<String, Advice>>();
-    private static Map<String, GroovyClassLoader> urlClassLoaders = new ConcurrentHashMap<String, GroovyClassLoader>();
+    private static Map<String, Map<String, Advice>> advices = new LinkedHashMap();
+    private static Map<String, GroovyClassLoader> urlClassLoaders = new ConcurrentHashMap();
+    private static List<String> urlList = new ArrayList();
 
-    private static GroovyClassLoader simpleLoader = new GroovyClassLoader(NCubeManager.class.getClassLoader());
-
+    static
+    {
+          urlClassLoaders.put("file", new CdnClassLoader(NCubeManager.class.getClassLoader(), true, true));
+    }
     /**
      * @param name String name of an NCube.
      * @return NCube instance with the given name.  Please note
@@ -83,17 +88,29 @@ public class NCubeManager
         return name + '.' + version;
     }
 
-    public static void setUrlClassLoader(List<String> urls, String version)
+    public static void setBaseResourceUrls(List<String> urls, String version)
     {
-
         if (urlClassLoaders.containsKey(version))
         {
-            throw new IllegalArgumentException("GroovyClassLoader URLs already set for version: " + version);
+            LOG.warn("RESETTING URLs for n-cube version: " + version + ", urls: " + urls);
         }
 
-        GroovyClassLoader urlClassLoader = new GroovyClassLoader(NCubeManager.class.getClassLoader());
-        urlClassLoaders.put(version, urlClassLoader);
+        urlList.clear();
+        urlList.addAll(urls);
 
+        GroovyClassLoader urlClassLoader = new CdnClassLoader(NCubeManager.class.getClassLoader(), true, true);
+        addUrlsToClassLoader(urls, urlClassLoader);
+        urlClassLoaders.put(version, urlClassLoader);
+    }
+
+    @Deprecated
+    public static void setUrlClassLoader(List<String> urls, String version)
+    {
+        setBaseResourceUrls(urls, version);
+    }
+
+    private static void addUrlsToClassLoader(List<String> urls, GroovyClassLoader urlClassLoader)
+    {
         for (String url : urls)
         {
             try
@@ -106,14 +123,9 @@ public class NCubeManager
             }
             catch (Exception e)
             {
-                throw new IllegalArgumentException("A URL in List of URLs is malformed: " + url);
+                throw new IllegalArgumentException("A URL in List of URLs is malformed: " + url, e);
             }
         }
-    }
-
-    public static URLClassLoader getSimpleLoader(String version)
-    {
-        return simpleLoader;
     }
 
     public static URLClassLoader getUrlClassLoader(String version)
@@ -188,13 +200,13 @@ public class NCubeManager
         synchronized (cubeList)
         {
             cubeList.clear();
-            simpleLoader.clearCache();
-            for (Map.Entry<String, GroovyClassLoader> entry : urlClassLoaders.entrySet())
+            GroovyBase.clearCache();
+            NCubeGroovyController.clearCache();
+            for (String version : urlClassLoaders.keySet())
             {
-                GroovyClassLoader classLoader = entry.getValue();
-                classLoader.clearCache();
+                GroovyClassLoader classLoader = urlClassLoaders.get(version);
+                classLoader.clearCache(); // free up Class cache
             }
-            GroovyBase.compiledClasses.clear();
             advices.clear();
         }
     }
@@ -209,7 +221,7 @@ public class NCubeManager
             Map<String, Advice> current = advices.get(wildcard);
             if (current == null)
             {
-                current = new LinkedHashMap<String, Advice>();
+                current = new LinkedHashMap();
                 advices.put(wildcard, current);
             }
 
@@ -260,9 +272,20 @@ public class NCubeManager
 
     private static void validateConnection(Connection c)
     {
-        if (c == null)
+        try
         {
-            throw new IllegalArgumentException("Connection cannot be null");
+            if (c == null)
+            {
+                throw new IllegalArgumentException("Connection cannot be null");
+            }
+            else if (c.isClosed())
+            {
+                throw new IllegalStateException("Connection already closed.");
+            }
+        }
+        catch (SQLException e)
+        {
+            throw new IllegalStateException("Error closing connection.", e);
         }
     }
 
@@ -309,12 +332,7 @@ public class NCubeManager
 
     public static void validateStatus(String status)
     {
-        if (StringUtilities.isEmpty(status))
-        {
-            throw new IllegalArgumentException("n-cube status cannot be null or empty");
-        }
-
-        if (status.equals("RELEASE") || status.equals("SNAPSHOT"))
+        if ("RELEASE".equals(status) || "SNAPSHOT".equals(status))
         {
             return;
         }
@@ -328,10 +346,8 @@ public class NCubeManager
      */
     public static NCube loadCube(Connection connection, String app, String name, String version, String status, Date sysDate)
     {
-        validateConnection(connection);
-        validateApp(app);
+        validate(connection, app, version);
         validateCubeName(name);
-        validateStatus(status);
         if (sysDate == null)
         {
             sysDate = new Date();
@@ -339,11 +355,12 @@ public class NCubeManager
 
         synchronized (cubeList)
         {
-            PreparedStatement stmt = null;
-            try
+            //  This is Java 7 specific, but will autoclose the statement
+            //  when it leaves the try statement.  If you want to change to this
+            //  let me know and I'll change the other instances.
+            try (PreparedStatement stmt = connection.prepareStatement("SELECT cube_value_bin FROM n_cube WHERE n_cube_nm = ? AND app_cd = ? AND sys_effective_dt <= ? AND (sys_expiration_dt IS NULL OR sys_expiration_dt >= ?) AND version_no_cd = ? AND status_cd = ?"))
             {
                 java.sql.Date systemDate = new java.sql.Date(sysDate.getTime());
-                stmt = connection.prepareStatement("SELECT cube_value_bin FROM n_cube WHERE n_cube_nm = ? AND app_cd = ? AND sys_effective_dt <= ? AND (sys_expiration_dt IS NULL OR sys_expiration_dt >= ?) AND version_no_cd = ? AND status_cd = ?");
 
                 stmt.setString(1, name);
                 stmt.setString(2, app);
@@ -389,6 +406,49 @@ public class NCubeManager
                 LOG.error(s, e);
                 throw new RuntimeException(s, e);
             }
+        }
+    }
+
+    /**
+     * Load an NCube from the database (any joined sub-cubes will also be loaded).
+     *
+     * @return NCube that matches, or null if not found.
+     */
+    public static boolean doesCubeExist(Connection connection, String app, String name, String version, String status, Date sysDate)
+    {
+        validate(connection, app, version);
+        validateCubeName(name);
+        validateStatus(status);
+
+        if (sysDate == null)
+        {
+            sysDate = new Date();
+        }
+
+        synchronized (cubeList)
+        {
+            PreparedStatement stmt = null;
+            try
+            {
+                java.sql.Date systemDate = new java.sql.Date(sysDate.getTime());
+                stmt = connection.prepareStatement("SELECT n_cube_nm FROM n_cube WHERE n_cube_nm = ? AND app_cd = ? AND sys_effective_dt <= ? AND (sys_expiration_dt IS NULL OR sys_expiration_dt >= ?) AND version_no_cd = ? AND status_cd = ?");
+
+                stmt.setString(1, name);
+                stmt.setString(2, app);
+                stmt.setDate(3, systemDate);
+                stmt.setDate(4, systemDate);
+                stmt.setString(5, version);
+                stmt.setString(6, status);
+                ResultSet rs = stmt.executeQuery();
+
+                return rs.next();
+            }
+            catch (Exception e)
+            {
+                String s = "Error finding cube: " + name + ", app: " + app + ", version: " + version + ", status: " + status + ", sysDate: " + sysDate + " from database";
+                LOG.error(s, e);
+                throw new RuntimeException(s, e);
+            }
             finally
             {
                 jdbcCleanup(stmt);
@@ -401,11 +461,10 @@ public class NCubeManager
      */
     public static void getReferencedCubeNames(Connection connection, String app, String name, String version, String status, Date sysDate, Set<String> refs)
     {
-        validateConnection(connection);
-        validateApp(app);
+        validate(connection, app, version);
         validateCubeName(name);
-        validateVersion(version);
         validateStatus(status);
+
         if (sysDate == null)
         {
             sysDate = new Date();
@@ -474,9 +533,7 @@ public class NCubeManager
      */
     public static Object[] getNCubes(Connection connection, String app, String version, String status, String sqlLike, Date sysDate)
     {
-        validateConnection(connection);
-        validateApp(app);
-        validateVersion(version);
+        validate(connection, app, version);
         validateStatus(status);
 
         if (sqlLike == null)
@@ -647,9 +704,7 @@ public class NCubeManager
      */
     public static boolean updateCube(Connection connection, String app, NCube ncube, String version)
     {
-        validateConnection(connection);
-        validateApp(app);
-        validateVersion(version);
+        validate(connection, app, version);
         if (ncube == null)
         {
             throw new IllegalArgumentException("NCube cannot be null for updating");
@@ -699,9 +754,7 @@ public class NCubeManager
      */
     public static void createCube(Connection connection, String app, NCube ncube, String version)
     {
-        validateConnection(connection);
-        validateApp(app);
-        validateVersion(version);
+        validate(connection, app, version);
         if (ncube == null)
         {
             throw new IllegalArgumentException("NCube cannot be null when creating a new n-cube");
@@ -775,9 +828,7 @@ public class NCubeManager
      */
     public static int releaseCubes(Connection connection, String app, String version)
     {
-        validateConnection(connection);
-        validateApp(app);
-        validateVersion(version);
+        validate(connection, app, version);
 
         synchronized (cubeList)
         {
@@ -828,9 +879,7 @@ public class NCubeManager
      */
     public static int createSnapshotCubes(Connection connection, String app, String relVersion, String newSnapVer)
     {
-        validateConnection(connection);
-        validateApp(app);
-        validateVersion(relVersion);
+        validate(connection, app, relVersion);
         validateVersion(newSnapVer);
 
         if (relVersion.equals(newSnapVer))
@@ -914,14 +963,19 @@ public class NCubeManager
         }
     }
 
+    private static void validate(Connection connection, String app, String relVersion)
+    {
+        validateConnection(connection);
+        validateApp(app);
+        validateVersion(relVersion);
+    }
+
     /**
      * Change the SNAPSHOT version value.
      */
     public static void changeVersionValue(Connection connection, String app, String currVersion, String newSnapVer)
     {
-        validateConnection(connection);
-        validateApp(app);
-        validateVersion(currVersion);
+        validate(connection, app, currVersion);
         validateVersion(newSnapVer);
 
         synchronized (cubeList)
@@ -971,9 +1025,7 @@ public class NCubeManager
 
     public static boolean renameCube(Connection connection, String oldName, String newName, String app, String version)
     {
-        validateConnection(connection);
-        validateApp(app);
-        validateVersion(version);
+        validate(connection, app, version);
         validateCubeName(oldName);
         validateCubeName(newName);
 
@@ -1027,10 +1079,8 @@ public class NCubeManager
      */
     public static boolean deleteCube(Connection connection, String app, String name, String version, boolean allowDelete)
     {
-        validateConnection(connection);
-        validateApp(app);
+        validate(connection, app, version);
         validateCubeName(name);
-        validateVersion(version);
 
         synchronized (cubeList)
         {
@@ -1076,10 +1126,8 @@ public class NCubeManager
      */
     public static boolean updateNotes(Connection connection, String app, String name, String version, String notes)
     {
-        validateConnection(connection);
-        validateApp(app);
+        validate(connection, app, version);
         validateCubeName(name);
-        validateVersion(version);
 
         synchronized (cubeList)
         {
@@ -1125,10 +1173,9 @@ public class NCubeManager
      */
     public static String getNotes(Connection connection, String app, String name, String version, Date sysDate)
     {
-        validateConnection(connection);
-        validateApp(app);
+        validate(connection, app, version);
         validateCubeName(name);
-        validateVersion(version);
+
         if (sysDate == null)
         {
             sysDate = new Date();
@@ -1176,10 +1223,8 @@ public class NCubeManager
      */
     public static boolean updateTestData(Connection connection, String app, String name, String version, String testData)
     {
-        validateConnection(connection);
-        validateApp(app);
+        validate(connection, app, version);
         validateCubeName(name);
-        validateVersion(version);
 
         synchronized (cubeList)
         {
@@ -1228,10 +1273,9 @@ public class NCubeManager
      */
     public static String getTestData(Connection connection, String app, String name, String version, Date sysDate)
     {
-        validateConnection(connection);
-        validateApp(app);
+        validate(connection, app, version);
         validateCubeName(name);
-        validateVersion(version);
+
         if (sysDate == null)
         {
             sysDate = new Date();
